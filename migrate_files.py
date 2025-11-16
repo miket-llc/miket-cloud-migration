@@ -7,14 +7,27 @@ It identifies files in the inbox directory that already exist elsewhere
 (excluding archive) and moves them to a timestamped archive folder.
 """
 
+import argparse
 import os
 import sys
 import hashlib
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from typing import Dict, Set, Tuple, Optional, List
+from typing import Dict, Set, Tuple, Optional, List, Iterable
+
+
+@dataclass
+class MigrationResult:
+    """Summary of a migration run."""
+
+    moved_files: int
+    failed_files: int
+    duplicate_files: List[Path]
+    migration_folder: Optional[Path]
+    archive_dir: Path
 
 
 def compute_file_hash(file_path: Path, chunk_size: int = 8192) -> Optional[str]:
@@ -41,8 +54,8 @@ def get_file_size(file_path: Path) -> Optional[int]:
 
 def build_file_index(
     directory: Path,
-    exclude_dirs: Set[str] = None,
-    exclude_paths: Set[Path] = None
+    exclude_dirs: Optional[Set[str]] = None,
+    exclude_paths: Optional[Set[Path]] = None,
 ) -> Dict[Tuple[int, str], Path]:
     """
     Build an index of files by (size, hash).
@@ -53,7 +66,7 @@ def build_file_index(
     if exclude_paths is None:
         exclude_paths = set()
     
-    file_index = {}
+    file_index: Dict[Tuple[int, str], Path] = {}
     exclude_dirs_lower = {d.lower() for d in exclude_dirs}
     exclude_paths_abs = {Path(p).resolve() for p in exclude_paths}
     
@@ -134,7 +147,7 @@ def find_duplicates(
     # Build index of all files in search directories (excluding archive)
     exclude_dirs = {archive_dir.name}
     exclude_paths = {archive_dir.resolve()}
-    existing_files = {}
+    existing_files: Dict[Tuple[int, str], Path] = {}
     
     for search_dir in search_dirs:
         if not search_dir.exists():
@@ -144,6 +157,10 @@ def find_duplicates(
         existing_files.update(index)
     
     print(f"\nFound {len(existing_files)} unique files in search directories.")
+
+    size_to_hashes: Dict[int, Set[str]] = defaultdict(set)
+    for size, file_hash in existing_files.keys():
+        size_to_hashes[size].add(file_hash)
     
     print("\n" + "="*60)
     print("Checking inbox files for duplicates...")
@@ -172,9 +189,9 @@ def find_duplicates(
             continue
         
         # Check if any file with same size exists
-        matching_sizes = [key for key in existing_files.keys() if key[0] == size]
-        
-        if not matching_sizes:
+        matching_hashes = size_to_hashes.get(size)
+
+        if not matching_hashes:
             # No file with same size, definitely not a duplicate
             duplicates[inbox_file] = False
             continue
@@ -186,7 +203,7 @@ def find_duplicates(
             continue
         
         # Check if exact match exists
-        if (size, inbox_hash) in existing_files:
+        if inbox_hash in matching_hashes:
             duplicates[inbox_file] = True
         else:
             duplicates[inbox_file] = False
@@ -246,103 +263,122 @@ def remove_empty_dirs(directory: Path):
         print(f"Removed {removed} empty directories from inbox.")
 
 
-def main():
-    """Main function."""
-    if len(sys.argv) < 3:
-        print("Usage: python migrate_files.py <inbox_dir> <search_dir1> [search_dir2 ...] [--archive <archive_dir>]")
-        print("\nExample:")
-        print("  python migrate_files.py inbox/ documents/ photos/ --archive archive/")
-        sys.exit(1)
-    
-    # Parse arguments
-    args = sys.argv[1:]
-    archive_dir = None
-    if '--archive' in args:
-        idx = args.index('--archive')
-        if idx + 1 < len(args):
-            archive_dir = Path(args[idx + 1])
-            args = args[:idx] + args[idx+2:]
-    
-    if len(args) < 2:
-        print("Error: Need at least inbox directory and one search directory.")
-        sys.exit(1)
-    
-    inbox_dir = Path(args[0])
-    search_dirs = [Path(d) for d in args[1:]]
-    
-    # Default archive directory
-    if archive_dir is None:
-        # Try to find archive directory in parent of inbox or search dirs
-        possible_archive = inbox_dir.parent / "archive"
-        if possible_archive.exists():
-            archive_dir = possible_archive
-        else:
-            archive_dir = inbox_dir.parent / "archive"
-            archive_dir.mkdir(exist_ok=True)
-    
-    # Validate directories
+def migrate_duplicates(
+    inbox_dir: Path,
+    search_dirs: Iterable[Path],
+    archive_dir: Optional[Path] = None,
+    *,
+    timestamp: Optional[str] = None,
+) -> MigrationResult:
+    """Run the migration process and return a summary of the work performed."""
+
+    inbox_dir = Path(inbox_dir)
+    search_dirs = [Path(d) for d in search_dirs]
+
+    if not search_dirs:
+        raise ValueError("At least one search directory must be provided.")
+
     if not inbox_dir.exists() or not inbox_dir.is_dir():
-        print(f"Error: Inbox directory {inbox_dir} does not exist or is not a directory.")
-        sys.exit(1)
-    
+        raise FileNotFoundError(f"Inbox directory {inbox_dir} does not exist or is not a directory.")
+
+    if archive_dir is None:
+        archive_dir = inbox_dir.parent / "archive"
+
+    archive_dir = archive_dir.resolve()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
     for search_dir in search_dirs:
         if not search_dir.exists() or not search_dir.is_dir():
             print(f"Warning: Search directory {search_dir} does not exist or is not a directory.")
-    
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    
-    print("="*60)
-    print("File Migration Utility")
-    print("="*60)
-    print(f"Inbox directory: {inbox_dir}")
-    print(f"Search directories: {', '.join(str(d) for d in search_dirs)}")
-    print(f"Archive directory: {archive_dir}")
-    print("="*60)
-    
-    # Find duplicates
+
     duplicates = find_duplicates(inbox_dir, search_dirs, archive_dir)
-    
     duplicate_files = [path for path, is_dup in duplicates.items() if is_dup]
-    
+
     if not duplicate_files:
         print("\nNo duplicate files found. Nothing to migrate.")
-        return
-    
-    # Create migration folder with timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    migration_folder = archive_dir / f"{timestamp}-migration"
+        return MigrationResult(0, 0, [], None, archive_dir)
+
+    migration_timestamp = timestamp or datetime.now().strftime("%Y-%m-%d-%H-%M")
+    migration_folder = archive_dir / f"{migration_timestamp}-migration"
     migration_folder.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"\n{'='*60}")
     print(f"Moving {len(duplicate_files)} duplicate files to archive...")
     print(f"Migration folder: {migration_folder}")
     print(f"{'='*60}")
-    
+
     moved = 0
     failed = 0
-    
+
     for i, file_path in enumerate(duplicate_files):
         if (i + 1) % 10 == 0:
             print(f"  Moved {i + 1}/{len(duplicate_files)} files...", end='\r')
-        
+
         if move_to_archive(file_path, inbox_dir, archive_dir, migration_folder):
             moved += 1
         else:
             failed += 1
-    
+
     print(f"\n  Moved {moved} files successfully.")
     if failed > 0:
         print(f"  Failed to move {failed} files.")
-    
-    # Remove empty directories
+
     print(f"\n{'='*60}")
     print("Cleaning up empty directories...")
     print(f"{'='*60}")
     remove_empty_dirs(inbox_dir)
-    
+
     print(f"\n{'='*60}")
     print("Migration complete!")
     print(f"{'='*60}")
+
+    return MigrationResult(moved, failed, duplicate_files, migration_folder, archive_dir)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+
+    parser = argparse.ArgumentParser(description="Move duplicate files from an inbox to an archive directory.")
+    parser.add_argument("inbox_dir", type=Path, help="Directory containing files to analyze")
+    parser.add_argument(
+        "search_dirs",
+        nargs="+",
+        type=Path,
+        help="Directories to search for existing files (duplicates)",
+    )
+    parser.add_argument(
+        "--archive",
+        type=Path,
+        help="Optional archive directory. Defaults to '<inbox_parent>/archive'.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """CLI entrypoint."""
+
+    args = parse_args(argv)
+
+    print("=" * 60)
+    print("File Migration Utility")
+    print("=" * 60)
+    print(f"Inbox directory: {args.inbox_dir}")
+    print(f"Search directories: {', '.join(str(d) for d in args.search_dirs)}")
+    print(f"Archive directory: {args.archive or args.inbox_dir.parent / 'archive'}")
+    print("=" * 60)
+
+    try:
+        result = migrate_duplicates(args.inbox_dir, args.search_dirs, args.archive)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+    if not result.duplicate_files:
+        return
+
+    print(f"\nSummary: moved {result.moved_files} files to {result.migration_folder}")
+    if result.failed_files:
+        print(f"Failures: {result.failed_files}")
 
 
 if __name__ == "__main__":

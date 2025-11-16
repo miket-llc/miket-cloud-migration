@@ -64,3 +64,15 @@ Only directories that contain files are created in the archive.
 - The utility will skip files it cannot read or hash
 - Empty folders in inbox are automatically deleted after migration
 
+## Testing
+
+Run the test suite with:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+The tests exercise the CLI entry point and the reusable `migrate_duplicates` workflow to ensure duplicate files are moved and
+that non-duplicate runs leave the inbox untouched.
+
